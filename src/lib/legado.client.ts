@@ -60,26 +60,69 @@ function isSafeHeaderName(name: string) {
   return /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name);
 }
 
+function isJsRuleString(value?: string) {
+  const trimmed = (value || '').trim();
+  return /^(?:@js:|<js>)/i.test(trimmed) || /<js>[\s\S]*?<\/js>/i.test(trimmed);
+}
+
+function resolveLegadoDynamicValue(value: any, context: Record<string, any>, timeout = 1000): any {
+  if (Array.isArray(value)) return value.map((item) => resolveLegadoDynamicValue(item, context, timeout));
+  if (!value || typeof value !== 'object') {
+    if (typeof value !== 'string') return value;
+    if (!isJsRuleString(value)) return value;
+    return evaluateJsRuleString(value, context, timeout);
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, val]) => [key, resolveLegadoDynamicValue(val, context, timeout)]));
+}
+
+function evaluateJsRuleString(value: string, context: Record<string, any>, timeout = 1000) {
+  const trimmed = value.trim();
+  if (/^(?:@js:|<js>)/i.test(trimmed)) return runJsSnippet(trimmed, context, timeout);
+  return value.replace(/<js>([\s\S]*?)<\/js>/gi, (_, code) => runJsSnippet(code, context, timeout));
+}
+
+function parseHeaderLines(raw: string, context: Record<string, any>) {
+  return raw.split('\n').reduce<Record<string, string>>((headers, line) => {
+    const index = line.indexOf(':');
+    if (index <= 0) return headers;
+    const name = line.slice(0, index).trim();
+    if (!isSafeHeaderName(name)) return headers;
+    const value = line.slice(index + 1).trim();
+    headers[name] = isJsRuleString(value) ? evaluateJsRuleString(value, context) : value;
+    return headers;
+  }, {});
+}
+
 function asObjectHeader(value?: string | Record<string, string>, context?: Record<string, any>): Record<string, string> {
   if (!value) return {};
-  if (typeof value === 'object') return value;
+  if (typeof value === 'object') return resolveLegadoDynamicValue(value, context || {});
   let raw = value.trim();
-  if (raw.startsWith('@js:')) {
-    raw = runJsSnippet(raw, context || {});
+  if (isJsRuleString(raw)) {
+    raw = evaluateJsRuleString(raw, context || {});
   }
   try {
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    if (!parsed || typeof parsed !== 'object') return {};
+    return resolveLegadoDynamicValue(parsed, context || {});
   } catch {
-    return raw.split('\n').reduce<Record<string, string>>((headers, line) => {
-      const index = line.indexOf(':');
-      if (index > 0) {
-        const name = line.slice(0, index).trim();
-        if (isSafeHeaderName(name)) headers[name] = line.slice(index + 1).trim();
-      }
-      return headers;
-    }, {});
+    return parseHeaderLines(raw, context || {});
   }
+}
+
+function resolveLegadoRule(rule?: LegadoBookSourceRule, source?: BookSource): LegadoBookSourceRule | undefined {
+  if (!rule) return rule;
+  const base = source?.url || rule.bookSourceUrl || '';
+  const context = { baseUrl: base, source: rule };
+  return resolveLegadoDynamicValue(rule, context);
+}
+
+function resolveLegadoSource(source: BookSource): BookSource {
+  const rule = resolveLegadoRule(source.legado, source);
+  const resolved: BookSource = {
+    ...source,
+    legado: rule,
+  };
+  return resolveLegadoDynamicValue(resolved, { baseUrl: source.url || rule?.bookSourceUrl || '', source: rule || source.legado || source });
 }
 
 function buildHeaders(source: BookSource): HeadersInit {
@@ -327,11 +370,11 @@ function applyPutGetRules(rule: string, value: string) {
 function buildUrlFromTemplate(template: string, source: BookSource, keyword?: string, page = 1, baseOverride?: string) {
   const base = baseOverride || sourceBase(source);
   let raw = template || base;
-  if (/^(?:@js:|<js>)/i.test(raw.trim())) {
+  if (isJsRuleString(raw)) {
     if (/\/k-\{\{encryptText\(key\)\}\}-\{\{page\}\}\.html/.test(raw)) {
       return `https://www.rrssk.com/k-${encryptTongrenKeyword(keyword || '')}-${page}.html`;
     }
-    const evaluated = runJsSnippet(raw, { key: keyword || '', keyword: keyword || '', page, baseUrl: base, source: { ...(source.legado || {}), key: base } });
+    const evaluated = evaluateJsRuleString(raw, { key: keyword || '', keyword: keyword || '', page, baseUrl: base, source: { ...(source.legado || {}), key: base } });
     raw = evaluated || raw;
     if (/,(\s*)\{/.test(raw)) return raw;
   }
@@ -460,7 +503,7 @@ function selectJsonItems(json: any, rule?: string): any[] {
 
 function evaluateJsListRule(rule: string | undefined, context: Record<string, any>): any[] {
   const trimmed = (rule || '').trim();
-  if (!/^(?:@js:|<js>)/i.test(trimmed)) return [];
+  if (!isJsRuleString(trimmed)) return [];
   const elementRules = Array.from(trimmed.matchAll(/java\.getElements\(\s*(['"`])([\s\S]*?)\1\s*\)/g)).map((match) => match[2]).filter(Boolean);
   if (elementRules.length > 0) {
     const raw = jsonPrimitiveToString(context.result ?? context.src ?? '');
@@ -500,7 +543,7 @@ function readJsonRule(json: any, rule?: string, source?: BookSource, baseUrl?: s
   if (!rule) return '';
   const trimmed = rule.trim();
   if (trimmed.includes('{{')) return renderTemplateWithJson(trimmed, json, source as BookSource, baseUrl || sourceBase(source as BookSource));
-  if (/^(?:@js:|<js>)/i.test(trimmed)) {
+  if (isJsRuleString(trimmed)) {
     if (/result\s*=\s*['"]([^'"]+)['"]\s*\+\s*result\.([A-Za-z0-9_$-]+)/.test(trimmed)) {
       const match = trimmed.match(/result\s*=\s*['"]([^'"]+)['"]\s*\+\s*result\.([A-Za-z0-9_$-]+)/);
       return normalizeUrl(baseUrl || sourceBase(source as BookSource), `${match?.[1] || ''}${jsonPrimitiveToString(json?.[match?.[2] || ''])}`);
@@ -779,13 +822,8 @@ function readValue($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: str
       if (value) return value;
       continue;
     }
-    if (/^<js>/i.test(alternative.trim())) {
-      const transformed = runJsSnippet(alternative, { ...(jsContext || {}), result: $.html(root), src: $.html(root), baseUrl });
-      if (transformed) return /^(?:https?:)?\/\//i.test(transformed) || transformed.startsWith('/') ? normalizeUrl(baseUrl || '', transformed) : transformed;
-      continue;
-    }
-    if (/^@js:/i.test(alternative.trim())) {
-      const transformed = runJsSnippet(alternative, { ...(jsContext || {}), result: $.html(root), src: $.html(root), baseUrl });
+    if (isJsRuleString(alternative)) {
+      const transformed = evaluateJsRuleString(alternative, { ...(jsContext || {}), result: $.html(root), src: $.html(root), baseUrl });
       if (transformed) return /^(?:https?:)?\/\//i.test(transformed) || transformed.startsWith('/') ? normalizeUrl(baseUrl || '', transformed) : transformed;
       continue;
     }
@@ -955,7 +993,7 @@ function applyContentJsRule(value: string, jsRule: string): string {
 
 function contentFromRule(raw: string, rule?: string, baseUrl?: string): string {
   const json = parseJsonMaybe(raw);
-  if (json && (ruleIsJson(rule) || rule?.trim().startsWith('@js:'))) {
+  if (json && (ruleIsJson(rule) || isJsRuleString(rule))) {
     return readJsonRule(json, rule, undefined, baseUrl);
   }
   const rawRule = rule || '';
@@ -1056,7 +1094,8 @@ export function normalizeImportedSources(input: unknown): BookSource[] {
         legado: rule,
       };
     })
-    .filter((source) => !!source.url);
+    .filter((source) => !!source.url)
+    .map((source) => resolveLegadoSource(source));
 }
 
 function normalizeConfiguredLegadoSource(item: any, index: number): BookSource | null {
@@ -1066,7 +1105,7 @@ function normalizeConfiguredLegadoSource(item: any, index: number): BookSource |
     const name = item.name || rule.bookSourceName || `Legado 书源 ${index + 1}`;
     const url = item.url || rule.bookSourceUrl || '';
     if (!url) return null;
-    return {
+    return resolveLegadoSource({
       ...item,
       id: item.id || `legado_${stableId(`${name}|${url}|${index}`)}`,
       name,
@@ -1075,7 +1114,7 @@ function normalizeConfiguredLegadoSource(item: any, index: number): BookSource |
       enabled: item.enabled !== false && rule.enabled !== false,
       authMode: item.authMode || 'none',
       legado: { ...rule, bookSourceName: rule.bookSourceName || name, bookSourceUrl: rule.bookSourceUrl || url },
-    };
+    });
   }
   if (item.bookSourceUrl || item.searchUrl || item.ruleSearch) {
     return normalizeImportedSources([item])[0] || null;
@@ -1205,7 +1244,7 @@ async function getSourceById(sourceId: string): Promise<BookSource> {
 
 function getRule(source: BookSource): LegadoBookSourceRule {
   if (!source.legado) throw new Error('Legado 书源缺少规则');
-  return source.legado;
+  return resolveLegadoRule(source.legado, source) || source.legado;
 }
 
 function makeItem(source: BookSource, partial: Partial<BookListItem> & { detailHref?: string; title?: string }): BookListItem {
@@ -1241,13 +1280,13 @@ function getEffectiveExploreRule(rule: LegadoBookSourceRule): LegadoRuleSearch |
 }
 
 function hasExplore(rule: LegadoBookSourceRule) {
-  return rule.enabledExplore !== false && (!!rule.exploreUrl?.trim().startsWith('@js:') || parseExploreUrl(rule.exploreUrl).length > 0) && !!getEffectiveExploreRule(rule);
+  return rule.enabledExplore !== false && (isJsRuleString(rule.exploreUrl) || parseExploreUrl(rule.exploreUrl).length > 0) && !!getEffectiveExploreRule(rule);
 }
 
 function parseExploreUrl(exploreUrl?: string): Array<{ title: string; template: string }> {
   const raw = (exploreUrl || '').trim();
   if (!raw) return [];
-  if (raw.startsWith('@js:')) return [];
+  if (isJsRuleString(raw)) return [];
   const json = parseJsonMaybe(raw);
   if (Array.isArray(json)) {
     return json
@@ -1288,7 +1327,7 @@ function buildExploreTargetUrl(source: BookSource, target: ExploreTarget) {
 
 async function resolveExploreCategories(source: BookSource, rule: LegadoBookSourceRule): Promise<Array<{ title: string; template: string }>> {
   const raw = (rule.exploreUrl || '').trim();
-  if (!raw.startsWith('@js:')) return parseExploreUrl(raw);
+  if (!isJsRuleString(raw)) return parseExploreUrl(raw);
 
   const jsValue = runJsSnippetRaw(raw, { baseUrl: sourceBase(source), source: rule });
   const parsed = Array.isArray(jsValue) ? jsValue : typeof jsValue === 'string' ? parseJsonMaybe(jsValue) : null;
@@ -1318,17 +1357,20 @@ export class LegadoClient {
   async getSources(): Promise<BookSource[]> {
     const config = await resolveLegadoConfig();
     if (!config.enabled) return [];
-    return config.sources.map((source) => ({
-      ...source,
-      capabilities: {
-        searchSupported: !!source.legado?.searchUrl,
-        catalogSupported: hasExplore(source.legado || {}),
-        searchMode: source.legado?.searchUrl ? 'legado' : 'disabled',
-        catalogMode: hasExplore(source.legado || {}) ? 'legado' : 'disabled',
-        acquisitionTypes: ['application/x-legado-chapters+json'],
-        lastCheckedAt: Date.now(),
-      },
-    }));
+    return config.sources.map((source) => {
+      const resolved = resolveLegadoSource(source);
+      return {
+        ...resolved,
+        capabilities: {
+          searchSupported: !!resolved.legado?.searchUrl,
+          catalogSupported: hasExplore(resolved.legado || {}),
+          searchMode: resolved.legado?.searchUrl ? 'legado' : 'disabled',
+          catalogMode: hasExplore(resolved.legado || {}) ? 'legado' : 'disabled',
+          acquisitionTypes: ['application/x-legado-chapters+json'],
+          lastCheckedAt: Date.now(),
+        },
+      };
+    });
   }
 
   async getSearchSources(sourceId?: string): Promise<BookSource[]> {
